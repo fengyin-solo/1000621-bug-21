@@ -18,7 +18,7 @@
       </article>
     </div>
 
-    <form class="filter-bar" @submit.prevent="reload">
+    <form class="filter-bar" @submit.prevent="applyFilters">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
         <input v-model="filters[field]" :placeholder="`按${field}检索`" />
@@ -50,20 +50,26 @@
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无检测项目数据，可先登记检测项目</td>
+          <td :colspan="columns.length + 1" class="empty-state">{{ emptyText }}</td>
         </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
       <span>共 {{ total }} 条检测项目记录</span>
+      <div class="pager">
+        <button class="btn ghost" type="button" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
+        <span>第 {{ page }} / {{ totalPages }} 页</span>
+        <button class="btn ghost" type="button" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
+      </div>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { request } from '@/api/client'
 
@@ -74,20 +80,103 @@ const columns = ["项目编码", "项目名称", "检测方法", "方法标准�
 const actions = ["启用项目", "提交修订", "停用项目"]
 const statuses = ["草稿", "已启用", "待修订", "已停用"]
 const stats = [{"label": "启用项目", "value": 0}, {"label": "待修订项目", "value": 0}, {"label": "本月新增项目", "value": 0}]
+const PAGE_SIZE = 20
+// 筛选框与后端查询参数的对应关系：列表、分页与导出共用这一套口径
+const FILTER_PARAMS: Record<string, string> = { "项目编码": "keyword", "项目名称": "name", "检测方法": "method" }
+
+const route = useRoute()
+const router = useRouter()
 
 const rows = ref<Row[]>([])
 const total = ref(0)
+const page = ref(1)
 const errorMessage = ref('')
 const filters = ref<Record<string, string>>({})
-const filterFields = columns.slice(0, 3)
+const filterFields = Object.keys(FILTER_PARAMS)
+// 只采纳最新一次响应，避免慢请求后到、把上一轮条件的结果盖回界面
+let requestSeq = 0
+
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
+const hasFilter = computed(() => filterFields.some((field) => (filters.value[field] ?? '').trim()))
+const emptyText = computed(() =>
+  hasFilter.value
+    ? '没有符合当前条件的检测项目，可调整或清空检索条件后重试'
+    : '暂无检测项目数据，可先登记检测项目',
+)
+
+function activeFilters(): Record<string, string> {
+  const active: Record<string, string> = {}
+  for (const field of filterFields) {
+    const value = (filters.value[field] ?? '').trim()
+    if (value) {
+      active[field] = value
+    }
+  }
+  return active
+}
+
+function buildQuery(): URLSearchParams {
+  const params = new URLSearchParams()
+  for (const [field, value] of Object.entries(activeFilters())) {
+    params.set(FILTER_PARAMS[field], value)
+  }
+  params.set('page', String(page.value))
+  params.set('size', String(PAGE_SIZE))
+  return params
+}
+
+// 把当前条件写回地址栏：刷新或重新进入后范围条件不丢
+function syncUrl() {
+  const query: Record<string, string> = {}
+  for (const [field, value] of Object.entries(activeFilters())) {
+    query[FILTER_PARAMS[field]] = value
+  }
+  if (page.value > 1) {
+    query.page = String(page.value)
+  }
+  void router.replace({ query })
+}
+
+function restoreFromUrl() {
+  const restored: Record<string, string> = {}
+  for (const field of filterFields) {
+    const value = route.query[FILTER_PARAMS[field]]
+    if (typeof value === 'string' && value.trim()) {
+      restored[field] = value.trim()
+    }
+  }
+  filters.value = restored
+  const rawPage = Number(route.query.page)
+  page.value = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : 1
+}
+
+function applyFilters() {
+  page.value = 1
+  syncUrl()
+  void reload()
+}
 
 function resetFilters() {
   filters.value = {}
+  page.value = 1
+  syncUrl()
+  void reload()
+}
+
+function goPage(target: number) {
+  if (target < 1 || target > totalPages.value || target === page.value) {
+    return
+  }
+  page.value = target
+  syncUrl()
   void reload()
 }
 
 function exportRows() {
-  window.open(`${ENDPOINT}/export`, '_blank')
+  const params = buildQuery()
+  params.delete('page')
+  params.delete('size')
+  window.open(`${ENDPOINT}/export?${params.toString()}`, '_blank')
 }
 
 function openCreate() {
@@ -112,19 +201,37 @@ async function runAction(action: string, row: Row) {
 
 async function reload() {
   errorMessage.value = ''
-  const query = new URLSearchParams(filters.value as Record<string, string>).toString()
+  const seq = ++requestSeq
   try {
-    const response = await request(`${ENDPOINT}?${query}`)
+    const response = await request(`${ENDPOINT}?${buildQuery().toString()}`)
     if (!response.ok) {
       throw new Error('检测项目列表读取失败')
     }
     const payload = await response.json()
-    rows.value = payload.items ?? []
-    total.value = payload.total ?? rows.value.length
+    if (seq !== requestSeq) {
+      return
+    }
+    const items = payload.items ?? []
+    const count = payload.total ?? items.length
+    if (!items.length && count > 0 && page.value > 1) {
+      // 当前页已被清空（例如刚停用了本页最后一条），退回还有数据的最后一页
+      page.value = Math.ceil(count / PAGE_SIZE)
+      syncUrl()
+      await reload()
+      return
+    }
+    rows.value = items
+    total.value = count
   } catch (error) {
+    if (seq !== requestSeq) {
+      return
+    }
     errorMessage.value = error instanceof Error ? error.message : '检测项目列表读取失败'
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  restoreFromUrl()
+  void reload()
+})
 </script>

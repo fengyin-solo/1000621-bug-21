@@ -19,15 +19,33 @@ STATUSES = ["草稿", "已启用", "待修订", "已停用"]
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按项目编码检索"),
-    status: str | None = Query(default=None, description="草稿、已启用、待修订、已停用"),
+    name: str | None = Query(default=None, description="按项目名称检索"),
+    method: str | None = Query(default=None, description="按检测方法检索"),
+    status: str | None = Query(default=None, description="草稿、已启用、待修订；已停用不进入列表"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按项目编码与状态过滤检测项目列表；没有数据时返回空页，不报错。"""
+    """按项目编码、项目名称、检测方法与状态过滤检测项目列表；没有数据时返回空页，不报错。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    items, total = service.list_entries(
+        keyword=keyword, name=name, method=method, status=status, page=page, size=size
+    )
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries(
+    keyword: str | None = Query(default=None, description="按项目编码检索"),
+    name: str | None = Query(default=None, description="按项目名称检索"),
+    method: str | None = Query(default=None, description="按检测方法检索"),
+    status: str | None = Query(default=None, description="草稿、已启用、待修订；已停用不进入导出"),
+) -> dict[str, Any]:
+    """导出检测项目清单：与列表走同一套过滤与排序口径，保证清单即页面所见。"""
+    items, total = service.list_entries(
+        keyword=keyword, name=name, method=method, status=status, page=1, size=10000
+    )
+    return {"module": "project", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +74,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出检测项目清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "project", "total": total, "items": items}
