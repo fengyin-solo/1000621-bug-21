@@ -19,15 +19,43 @@ STATUSES = ["草稿", "已启用", "待修订", "已停用"]
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按项目编码检索"),
-    status: str | None = Query(default=None, description="草稿、已启用、待修订、已停用"),
+    status: str | None = Query(default=None, description="草稿、已启用、待修订"),
+    code: str | None = Query(default=None, alias="项目编码", description="按项目编码收窄范围"),
+    name: str | None = Query(default=None, alias="项目名称", description="按项目名称收窄范围"),
+    method: str | None = Query(default=None, alias="检测方法", description="按检测方法收窄范围"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
-    """按项目编码与状态过滤检测项目列表；没有数据时返回空页，不报错。"""
+    """按项目编码等条件过滤检测项目列表；已停用项目不进结果，没有匹配时返回空页而不是全量。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
+    items, total = service.list_entries(
+        keyword=keyword,
+        status=status,
+        filters={"项目编码": code, "项目名称": name, "检测方法": method},
+        page=page,
+        size=size,
+    )
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/export")
+def export_entries(
+    keyword: str | None = Query(default=None, description="按项目编码检索"),
+    status: str | None = Query(default=None, description="草稿、已启用、待修订"),
+    code: str | None = Query(default=None, alias="项目编码", description="按项目编码收窄范围"),
+    name: str | None = Query(default=None, alias="项目名称", description="按项目名称收窄范围"),
+    method: str | None = Query(default=None, alias="检测方法", description="按检测方法收窄范围"),
+) -> dict[str, Any]:
+    """导出检测项目清单：与列表页同一套范围条件与收费单价次序，已停用项目不带出。"""
+    items, total = service.list_entries(
+        keyword=keyword,
+        status=status,
+        filters={"项目编码": code, "项目名称": name, "检测方法": method},
+        page=1,
+        size=10000,
+    )
+    return {"module": "project", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +84,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出检测项目清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "project", "total": total, "items": items}
